@@ -1,0 +1,375 @@
+###############################################################################
+# Supabase Self-Hosted — Dokploy-Compatible
+#
+# Key differences from the official docker-compose.yml:
+#   - No `container_name` (Dokploy names containers automatically)
+#   - No `ports:` mappings — uses `expose:` only; Traefik routes traffic
+#   - Internal services join the compose `default` network (project-scoped,
+#     auto-named `<project>_default`) so multiple Supabase stacks in the
+#     same Dokploy host don't collide on hostnames like `db`, `meta`, etc.
+#     Only `kong` joins `dokploy-network` for Traefik ingress.
+#   - env_file: .env on each service
+#   - PostgreSQL 17 (matches supabase/postgres image series)
+#   - No supavisor — app uses HTTP/PostgREST, not direct Postgres connections
+#   - db-setup resets internal role passwords after db init (required — see below)
+#
+# Why db-setup is required:
+#   supabase/postgres:17.x uses 'supabase_admin' as its superuser (not 'postgres').
+#   The image's built-in init scripts create roles (supabase_auth_admin, authenticator,
+#   supabase_storage_admin) with hardcoded passwords. db-setup resets them all to
+#   POSTGRES_PASSWORD so auth/rest/realtime/storage can connect.
+#   Do NOT mount ./volumes/db/init into /docker-entrypoint-initdb.d — that overrides
+#   the image's own init scripts and breaks role creation entirely.
+###############################################################################
+
+x-supabase-common: &supabase-common
+  env_file: .env
+  restart: unless-stopped
+  # No `networks:` here — services join the compose default network
+  # (auto-named <project>_default) for stack-local isolation. Only kong
+  # additionally joins dokploy-network for Traefik ingress.
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  db_data_v4:
+  storage_data:
+
+services:
+
+  ##############################################################################
+  # PostgreSQL 17
+  # Do NOT mount ./volumes/db/init into /docker-entrypoint-initdb.d — it overrides
+  # the image's built-in scripts and prevents role creation.
+  ##############################################################################
+  db:
+    <<: *supabase-common
+    image: supabase/postgres:17.6.1.097
+    expose:
+      - "5432"
+    volumes:
+      - db_data_v4:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supabase_admin -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ##############################################################################
+  # db-setup — resets internal role passwords to POSTGRES_PASSWORD.
+  # supabase/postgres superuser is 'supabase_admin' (not 'postgres').
+  # Internal roles (supabase_auth_admin, supabase_storage_admin, authenticator)
+  # are created with hardcoded passwords during image init; this fixes them.
+  # Storage also expects:
+  #   - supabase_storage_admin to bypass RLS on storage tables
+  #   - service_role to have table privileges on the storage schema for Studio/admin flows
+  ##############################################################################
+  db-setup:
+    <<: *supabase-common
+    image: postgres:17-alpine
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        psql -v ON_ERROR_STOP=1 -h db -U supabase_admin -d postgres \
+          -c "ALTER ROLE supabase_auth_admin    WITH PASSWORD '${POSTGRES_PASSWORD}';" \
+          -c "ALTER ROLE supabase_storage_admin WITH PASSWORD '${POSTGRES_PASSWORD}';" \
+          -c "ALTER ROLE supabase_storage_admin BYPASSRLS;" \
+          -c "ALTER ROLE authenticator          WITH PASSWORD '${POSTGRES_PASSWORD}';" \
+          -c "GRANT USAGE ON SCHEMA storage TO service_role;" \
+          -c "GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA storage TO service_role;" \
+          -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA storage TO service_role;" \
+          -c "ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage GRANT ALL ON TABLES    TO service_role;" \
+          -c "ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage GRANT ALL ON SEQUENCES TO service_role;" \
+          -c "CREATE SCHEMA IF NOT EXISTS _realtime; GRANT ALL ON SCHEMA _realtime TO supabase_admin;"
+
+  ##############################################################################
+  # Kong — API gateway
+  # Dokploy domain: supabase.yourdomain.com → kong:8000
+  # WebSocket: enable WebSocket support in Dokploy domain settings (see README)
+  ##############################################################################
+  kong:
+    <<: *supabase-common
+    image: kong:2.8.1
+    # Kong is the only service that joins dokploy-network — it's the
+    # ingress point Traefik routes to.
+    #
+    # KONG_ALIAS is REQUIRED and must be unique across every Supabase
+    # stack on the same Dokploy host. The bare service name `kong` is
+    # ambiguous when multiple stacks share dokploy-network; the alias
+    # disambiguates so apps can address a specific stack's Kong via:
+    #   SUPABASE_INTERNAL_URL=http://${KONG_ALIAS}:8000
+    # Convention: `<project>-kong` (e.g. `myapp-kong`). See README §Multi-stack.
+    networks:
+      default:
+      dokploy-network:
+        aliases:
+          - ${KONG_ALIAS:?KONG_ALIAS must be set in .env (e.g. myapp-kong) — see README}
+    expose:
+      - "8000"
+      - "8443"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Startup script substitutes ${VAR} in kong template using sed before Kong starts.
+    # Kong DB-less mode does not expand env vars natively.
+    entrypoint: /bin/sh /home/kong/startup.sh
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: "64 160k"
+      KONG_LOG_LEVEL: notice
+      KONG_DNS_NOT_FOUND_TTL: 1
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-supabase}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      STUDIO_HOSTNAME: ${STUDIO_HOSTNAME}
+    volumes:
+      - ./volumes/api/kong.yml:/home/kong/temp.yml:ro
+      - ./volumes/api/kong-startup.sh:/home/kong/startup.sh:ro
+
+  ##############################################################################
+  # Auth — GoTrue
+  ##############################################################################
+  auth:
+    <<: *supabase-common
+    image: supabase/gotrue:v2.164.0
+    expose:
+      - "9999"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      GOTRUE_API_HOST: "0.0.0.0"
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DISABLE_SIGNUP: ${GOTRUE_DISABLE_SIGNUP:-false}
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${GOTRUE_JWT_EXP:-3600}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+
+      # Set to "false" in production if you want email confirmation on signup.
+      # "true" allows signup without SMTP — useful when using OAuth-only auth.
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+
+      # Google OAuth — optional. Remove these four lines if not using Google OAuth.
+      GOTRUE_EXTERNAL_GOOGLE_ENABLED: "true"
+      GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID}
+      GOTRUE_EXTERNAL_GOOGLE_SECRET: ${GOTRUE_EXTERNAL_GOOGLE_SECRET}
+      GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: ${API_EXTERNAL_URL}/auth/v1/callback
+
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_SMS_AUTOCONFIRM: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9999/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  ##############################################################################
+  # REST — PostgREST
+  ##############################################################################
+  rest:
+    <<: *supabase-common
+    image: postgrest/postgrest:v12.2.0
+    expose:
+      - "3000"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${GOTRUE_JWT_EXP:-3600}
+    command: ["postgrest"]
+
+  ##############################################################################
+  # Realtime — WebSocket subscriptions (postgres_changes)
+  ##############################################################################
+  realtime:
+    <<: *supabase-common
+    image: supabase/realtime:v2.33.72
+    # Realtime derives the tenant id from the upstream host. The official
+    # Supabase stack routes websocket traffic to realtime-dev.supabase-realtime
+    # so that the seeded realtime-dev tenant is selected. Alias lives on the
+    # project-default network — Kong reaches realtime through this network,
+    # not dokploy-network.
+    networks:
+      default:
+        aliases:
+          - realtime-dev.supabase-realtime
+    expose:
+      - "4000"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: "SET search_path TO _realtime"
+      DB_ENC_KEY: ${REALTIME_DB_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      APP_NAME: realtime
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      RUN_JANITOR: "true"
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      ERL_AFLAGS: "-proto_dist inet_tcp"
+      ENABLE_TAILSCALE: "false"
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      # Seed the realtime-dev tenant on first start using the DB_* env vars above.
+      # This calls /app/bin/seed_self_host which creates the tenant with properly
+      # encrypted credentials (using DB_ENC_KEY), replacing any plain-text rows.
+      SEED_SELF_HOST: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sSfL --head -o /dev/null -H \"Authorization: Bearer ${ANON_KEY}\" http://localhost:4000/api/tenants/realtime-dev/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ##############################################################################
+  # Storage — File storage API (PDF uploads)
+  ##############################################################################
+  storage:
+    <<: *supabase-common
+    image: supabase/storage-api:v1.11.13
+    expose:
+      - "5000"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+      rest:
+        condition: service_started
+      imgproxy:
+        condition: service_started
+    volumes:
+      - storage_data:/var/lib/storage
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      FILE_SIZE_LIMIT: ${FILE_SIZE_LIMIT:-52428800}
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+      IMGPROXY_URL: http://imgproxy:5001
+      # Required for correct file URL generation behind Traefik reverse proxy
+      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      ENABLE_IMAGE_TRANSFORMATION: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ##############################################################################
+  # imgproxy — Required by Storage (cannot be removed without patching Storage)
+  ##############################################################################
+  imgproxy:
+    <<: *supabase-common
+    image: darthsim/imgproxy:v3.8.0
+    expose:
+      - "5001"
+    volumes:
+      - storage_data:/var/lib/storage
+    environment:
+      IMGPROXY_BIND: ":5001"
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
+      IMGPROXY_USE_ETAG: "true"
+      IMGPROXY_ENABLE_WEBP_DETECTION: "true"
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ##############################################################################
+  # postgres-meta — Metadata API (used by Studio)
+  ##############################################################################
+  meta:
+    <<: *supabase-common
+    image: supabase/postgres-meta:v0.84.2
+    expose:
+      - "8080"
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: supabase_admin
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY}
+
+  ##############################################################################
+  # Studio — Supabase Dashboard
+  # SECURITY: Do NOT expose Studio publicly in production.
+  # Access via SSH tunnel: ssh -L 3000:localhost:3000 user@server
+  # See README for details.
+  ##############################################################################
+  studio:
+    <<: *supabase-common
+    image: supabase/studio:20250317-6955350
+    expose:
+      - "3000"
+    depends_on:
+      auth:
+        condition: service_healthy
+      meta:
+        condition: service_started
+    environment:
+      STUDIO_PG_META_URL: http://meta:8080
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      DEFAULT_ORGANIZATION_NAME: "Default Organization"
+      DEFAULT_PROJECT_NAME: "Default Project"
+
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+
+      STUDIO_PORT: "3000"
+      LOGFLARE_API_KEY: ""
+      LOGFLARE_URL: ""
+      NEXT_PUBLIC_ENABLE_LOGS: "false"
+      NEXT_ANALYTICS_BACKEND_PROVIDER: postgres

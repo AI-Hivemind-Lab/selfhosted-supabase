@@ -1,0 +1,5 @@
+.env
+*.env.local
+volumes/db/data/
+volumes/storage/data/
+.DS_Store
